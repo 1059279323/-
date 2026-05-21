@@ -52,19 +52,33 @@ def _dedup(items: list[dict]) -> list[dict]:
 # 文档类型检测
 # ═══════════════════════════════════════════════════════════
 
-# 行程单 — 强特征词（命中 1 个即判定为行程单）
+# ── 发票排除词：行程单页面中若命中任意一个，判定为发票 ──
+_INVOICE_EXCLUDE = [
+    "发票代码", "发票号码", "价税合计",
+    "增值税", "销售方", "购买方",
+    "货物或应税劳务", "税额",
+]
+
+# ── 行程单排除词：发票页面中若命中任意一个，判定为行程单 ──
+_ITINERARY_EXCLUDE = [
+    "电子客票", "客票号", "电子客票号",
+    "ETKT", "航空运输", "民航发展基金",
+    "票价", "燃油附加费",
+]
+
+# 行程单 — 强特征词（命中 1 个即判为行程单，会被排除词否决）
 _ITINERARY_STRONG = [
     "电子客票", "电子客票号", "客票号",
     "ETKT", "ITINERARY", "AIRLINE",
 ]
 
-# 行程单 — 辅助特征词（需与强特征组合或自身命中 >=2 个）
+# 行程单 — 辅助特征词（命中 >=2 个判为行程单，会被排除词否决）
 _ITINERARY_WEAK = [
-    "行程单", "航空运输", "票价", "燃油附加费",
-    "民航发展基金", "航班号", "承运人",
-    "签注", "合计", "填开", "身份证",
-    "证件号", "保险费", "BSP", "客票",
-    "承运", "TOTAL",
+    "行程单", "航空运输", "票价合计", "票价总计",
+    "燃油附加费", "民航发展基金", "航班号",
+    "承运人", "签注", "填开", "保险费",
+    "BSP", "客票", "承运", "TOTAL",
+    "票价", "证件号", "身份证",
 ]
 
 # 发票特征关键词（至少匹配 2 个才判定为发票）
@@ -87,10 +101,13 @@ def _count_keywords(text: str, keywords: list[str]) -> int:
 def _is_itinerary_page(text: str) -> bool:
     """判断页面内容是否是行程单。
 
-    判定逻辑：
+    判定逻辑（有序）：
+    0. 命中任意发票排除词 → 直接否决（不是行程单）
     1. 命中任意 1 个强特征词 → 是行程单
     2. 命中 >=2 个辅助特征词 → 是行程单
     """
+    if _count_keywords(text, _INVOICE_EXCLUDE) >= 1:
+        return False
     if _count_keywords(text, _ITINERARY_STRONG) >= 1:
         return True
     if _count_keywords(text, _ITINERARY_WEAK) >= 2:
@@ -99,7 +116,14 @@ def _is_itinerary_page(text: str) -> bool:
 
 
 def _is_invoice_page(text: str) -> bool:
-    """判断页面内容是否是发票。"""
+    """判断页面内容是否是发票。
+
+    判定逻辑（有序）：
+    0. 命中任意行程单排除词 → 直接否决（不是发票）
+    1. 命中 >=2 个发票关键词 → 是发票
+    """
+    if _count_keywords(text, _ITINERARY_EXCLUDE) >= 1:
+        return False
     return _count_keywords(text, _INVOICE_KEYWORDS) >= 2
 
 
