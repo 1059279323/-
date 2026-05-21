@@ -49,6 +49,46 @@ def _dedup(items: list[dict]) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
+# 文档类型检测
+# ═══════════════════════════════════════════════════════════
+
+# 行程单特征关键词（至少匹配 2 个才判定为行程单）
+_ITINERARY_KEYWORDS = [
+    "电子客票", "行程单", "航空运输", "客票号",
+    "票价", "燃油附加费", "民航发展基金",
+    "航班号", "承运人", "电子客票号", "签注",
+]
+
+# 发票特征关键词（至少匹配 2 个才判定为发票）
+_INVOICE_KEYWORDS = [
+    "发票代码", "发票号码", "价税合计",
+    "增值税", "货物或应税劳务", "销售方", "购买方",
+    "税率", "税额", "发票", "开票日期",
+]
+
+
+def _has_keywords(text: str, keywords: list[str], min_hits: int = 2) -> bool:
+    """检测文本中是否包含至少 min_hits 个关键词。"""
+    hits = 0
+    for kw in keywords:
+        if kw in text:
+            hits += 1
+            if hits >= min_hits:
+                return True
+    return False
+
+
+def _is_itinerary_page(text: str) -> bool:
+    """判断页面内容是否是行程单。"""
+    return _has_keywords(text, _ITINERARY_KEYWORDS, min_hits=2)
+
+
+def _is_invoice_page(text: str) -> bool:
+    """判断页面内容是否是发票。"""
+    return _has_keywords(text, _INVOICE_KEYWORDS, min_hits=2)
+
+
+# ═══════════════════════════════════════════════════════════
 # 行程单提取
 # ═══════════════════════════════════════════════════════════
 
@@ -88,6 +128,11 @@ def _itinerary_from_tables(tables) -> list[dict]:
 
 
 def extract_itinerary_page(page_text: str, tables) -> list[dict]:
+    """提取行程单页面金额。非行程单页面返回空列表。"""
+    # ── 类型检测：不是行程单的页面直接跳过 ──
+    if not _is_itinerary_page(page_text):
+        return []
+
     items = _itinerary_from_text(page_text)
     items += _itinerary_from_tables(tables)
     if not items:
@@ -114,6 +159,11 @@ _INVOICE_PATTERNS = [
 
 
 def extract_invoice_page(page_text: str) -> list[dict]:
+    """提取发票页面金额。非发票页面返回空列表。"""
+    # ── 类型检测：不是发票的页面直接跳过 ──
+    if not _is_invoice_page(page_text):
+        return []
+
     compact = re.sub(r"\s+", "", page_text)
     items: list[dict] = []
 
@@ -145,8 +195,12 @@ def extract_invoice_page(page_text: str) -> list[dict]:
 # 通用 PDF 处理
 # ═══════════════════════════════════════════════════════════
 
-def process_pdfs(uploaded_files, extract_fn, progress_placeholder) -> pd.DataFrame:
-    """逐页处理上传文件，每页调用 extract_fn(txt, tables) 返回 DataFrame。"""
+def process_pdfs(uploaded_files, extract_fn, progress_placeholder,
+                 doc_type: str = "") -> pd.DataFrame:
+    """逐页处理上传文件，每页调用 extract_fn 返回 DataFrame。
+
+    doc_type: 文档类型名称（行程单/发票），仅用于日志状态描述。
+    """
     rows: list[dict] = []
     total = len(uploaded_files)
 
@@ -159,13 +213,19 @@ def process_pdfs(uploaded_files, extract_fn, progress_placeholder) -> pd.DataFra
         try:
             raw = f.read()
         except Exception as e:
-            rows.append({"文件名": f.name, "页码": "-", "来源": "", "识别金额": 0.0, "状态": "read_err", "备注": str(e)})
+            rows.append({
+                "文件名": f.name, "页码": "-", "来源": "",
+                "识别金额": 0.0, "状态": "read_err", "备注": str(e),
+            })
             continue
 
         try:
             pdf = pdfplumber.open(BytesIO(raw))
         except Exception as e:
-            rows.append({"文件名": f.name, "页码": "-", "来源": "", "识别金额": 0.0, "状态": "open_err", "备注": str(e)})
+            rows.append({
+                "文件名": f.name, "页码": "-", "来源": "",
+                "识别金额": 0.0, "状态": "open_err", "备注": str(e),
+            })
             continue
 
         has_text = False
@@ -180,19 +240,35 @@ def process_pdfs(uploaded_files, extract_fn, progress_placeholder) -> pd.DataFra
             has_text = True
             tables = page.extract_tables() or []
             items = extract_fn(txt, tables)
-            for it in items:
+            if items:
+                for it in items:
+                    rows.append({
+                        "文件名": f.name,
+                        "页码": f"第{pn}页",
+                        "来源": it["source"],
+                        "识别金额": it["amount"],
+                        "状态": "ok",
+                        "备注": "",
+                    })
+            else:
+                # 有文本但提取结果为空 — 页面类型不匹配或识别不到
                 rows.append({
                     "文件名": f.name,
                     "页码": f"第{pn}页",
-                    "来源": it["source"],
-                    "识别金额": it["amount"],
-                    "状态": "ok",
-                    "备注": "",
+                    "来源": "",
+                    "识别金额": 0.0,
+                    "状态": "type_mismatch",
+                    "备注": f"该页不是{doc_type}或未能识别金额",
                 })
+
         pdf.close()
 
         if not has_text:
-            rows.append({"文件名": f.name, "页码": "-", "来源": "", "识别金额": 0.0, "状态": "no_text", "备注": "全部页面均无文字，可能为扫描件"})
+            rows.append({
+                "文件名": f.name, "页码": "-", "来源": "",
+                "识别金额": 0.0, "状态": "no_text",
+                "备注": "全部页面均无文字，可能为扫描件",
+            })
 
     progress_placeholder.empty()
     return pd.DataFrame(rows)
@@ -208,12 +284,15 @@ def render_results(df: pd.DataFrame, prefix: str):
 
     total_amount = df["识别金额"].sum()
     ok_count = int((df["状态"] == "ok").sum())
+    skipped_count = int((df["状态"] == "type_mismatch").sum())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("📄 文件数", df["文件名"].nunique())
     c2.metric("📋 识别条目", len(df))
     c3.metric("✅ 成功条目", ok_count)
     c4.metric("💰 汇总金额", f"¥{total_amount:,.2f}")
+    if skipped_count > 0:
+        st.caption(f"⏭️ 跳过 {skipped_count} 个非{prefix}页面（类型不匹配）")
 
     st.markdown("---")
     st.caption("📊 识别明细（每页每条各占一行）")
@@ -224,6 +303,7 @@ def render_results(df: pd.DataFrame, prefix: str):
         "no_text": "⚠️ 无文本",
         "read_err": "❌ 读取失败",
         "open_err": "❌ 打开失败",
+        "type_mismatch": "⏭️ 已跳过",
     }
 
     disp = df.copy()
@@ -231,7 +311,7 @@ def render_results(df: pd.DataFrame, prefix: str):
     disp["状态"] = disp["状态"].map(status_labels)
     st.dataframe(disp[["文件名", "页码", "来源", "识别金额", "状态"]], use_container_width=True, hide_index=True)
 
-    # 来源详情
+    # 来源详情（仅展示成功条目）
     with st.expander("🔍 查看提取来源"):
         for _, row in df.iterrows():
             if row["状态"] != "ok":
@@ -262,6 +342,7 @@ def render_results(df: pd.DataFrame, prefix: str):
 def tab_itinerary():
     st.subheader("✈️ 行程单识别")
     st.caption("上传航空运输电子客票行程单 PDF（支持多页合并），自动提取每张行程单的金额并汇总")
+    st.info("⚠️ 仅识别**行程单**页面（检测"电子客票/票价/承运人"等特征），发票页将被自动跳过。")
 
     uploaded = st.file_uploader(
         "上传行程单 PDF", type=["pdf"], accept_multiple_files=True,
@@ -275,7 +356,8 @@ def tab_itinerary():
     if st.button("🔍 开始识别行程单", type="primary", use_container_width=True, key="itin_btn"):
         with st.spinner("正在逐页识别行程单…"):
             p = st.empty()
-            df = process_pdfs(uploaded, lambda t, tb: extract_itinerary_page(t, tb), p)
+            df = process_pdfs(uploaded, lambda t, tb: extract_itinerary_page(t, tb), p,
+                              doc_type="行程单")
             st.session_state["itin_df"] = df
 
     if "itin_df" in st.session_state and not st.session_state["itin_df"].empty:
@@ -290,6 +372,7 @@ def tab_itinerary():
 def tab_invoice():
     st.subheader("🧾 发票识别")
     st.caption("上传增值税发票 / 普通发票 PDF（支持多页合并），自动提取每张发票的金额并汇总")
+    st.info("⚠️ 仅识别**发票**页面（检测"发票代码/价税合计/增值税"等特征），行程单页将被自动跳过。")
 
     uploaded = st.file_uploader(
         "上传发票 PDF", type=["pdf"], accept_multiple_files=True,
@@ -303,7 +386,8 @@ def tab_invoice():
     if st.button("🔍 开始识别发票", type="primary", use_container_width=True, key="inv_btn"):
         with st.spinner("正在逐页识别发票…"):
             p = st.empty()
-            df = process_pdfs(uploaded, lambda t, _: extract_invoice_page(t), p)
+            df = process_pdfs(uploaded, lambda t, _: extract_invoice_page(t), p,
+                              doc_type="发票")
             st.session_state["inv_df"] = df
 
     if "inv_df" in st.session_state and not st.session_state["inv_df"].empty:
