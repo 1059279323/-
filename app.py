@@ -52,11 +52,19 @@ def _dedup(items: list[dict]) -> list[dict]:
 # 文档类型检测
 # ═══════════════════════════════════════════════════════════
 
-# 行程单特征关键词（至少匹配 2 个才判定为行程单）
-_ITINERARY_KEYWORDS = [
-    "电子客票", "行程单", "航空运输", "客票号",
-    "票价", "燃油附加费", "民航发展基金",
-    "航班号", "承运人", "电子客票号", "签注",
+# 行程单 — 强特征词（命中 1 个即判定为行程单）
+_ITINERARY_STRONG = [
+    "电子客票", "电子客票号", "客票号",
+    "ETKT", "ITINERARY", "AIRLINE",
+]
+
+# 行程单 — 辅助特征词（需与强特征组合或自身命中 >=2 个）
+_ITINERARY_WEAK = [
+    "行程单", "航空运输", "票价", "燃油附加费",
+    "民航发展基金", "航班号", "承运人",
+    "签注", "合计", "填开", "身份证",
+    "证件号", "保险费", "BSP", "客票",
+    "承运", "TOTAL",
 ]
 
 # 发票特征关键词（至少匹配 2 个才判定为发票）
@@ -67,39 +75,55 @@ _INVOICE_KEYWORDS = [
 ]
 
 
-def _has_keywords(text: str, keywords: list[str], min_hits: int = 2) -> bool:
-    """检测文本中是否包含至少 min_hits 个关键词。"""
-    hits = 0
+def _count_keywords(text: str, keywords: list[str]) -> int:
+    """统计文本中命中关键词的数量。"""
+    cnt = 0
     for kw in keywords:
         if kw in text:
-            hits += 1
-            if hits >= min_hits:
-                return True
-    return False
+            cnt += 1
+    return cnt
 
 
 def _is_itinerary_page(text: str) -> bool:
-    """判断页面内容是否是行程单。"""
-    return _has_keywords(text, _ITINERARY_KEYWORDS, min_hits=2)
+    """判断页面内容是否是行程单。
+
+    判定逻辑：
+    1. 命中任意 1 个强特征词 → 是行程单
+    2. 命中 >=2 个辅助特征词 → 是行程单
+    """
+    if _count_keywords(text, _ITINERARY_STRONG) >= 1:
+        return True
+    if _count_keywords(text, _ITINERARY_WEAK) >= 2:
+        return True
+    return False
 
 
 def _is_invoice_page(text: str) -> bool:
     """判断页面内容是否是发票。"""
-    return _has_keywords(text, _INVOICE_KEYWORDS, min_hits=2)
+    return _count_keywords(text, _INVOICE_KEYWORDS) >= 2
 
 
 # ═══════════════════════════════════════════════════════════
 # 行程单提取
 # ═══════════════════════════════════════════════════════════
 
+# 行程单金额行的匹配关键词
+_ITINERARY_AMOUNT_PAT = re.compile(
+    r"(合计|总计|TOTAL|票价合计|票价总计|金额合计|应付|实付|票价[：:]|FARE[：:]?)",
+    re.IGNORECASE,
+)
+
+
 def _itinerary_from_text(page_text: str) -> list[dict]:
+    """从行程单文本行中提取金额（合计行 / TOTAL 行 / 票价行）。"""
     items: list[dict] = []
     for line in page_text.split("\n"):
-        if not re.search(r"(合计|总计|应付|实付|金额合计)", line):
+        if not _ITINERARY_AMOUNT_PAT.search(line):
             continue
         nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", line)
         if not nums:
             continue
+        # 行程单合计行通常金额在行尾，取最后一个金额
         v = clean_amount(nums[-1])
         if v:
             items.append({"amount": v, "source": line.strip()[:120]})
@@ -107,6 +131,7 @@ def _itinerary_from_text(page_text: str) -> list[dict]:
 
 
 def _itinerary_from_tables(tables) -> list[dict]:
+    """从行程单表格中提取金额（合计行 / TOTAL 行）。"""
     items: list[dict] = []
     for tbl in (tables or []):
         if not tbl:
@@ -115,7 +140,7 @@ def _itinerary_from_tables(tables) -> list[dict]:
             if not row:
                 continue
             row_text = " ".join(str(c) for c in row if c)
-            if not re.search(r"(合计|总计|小计)", row_text):
+            if not _ITINERARY_AMOUNT_PAT.search(row_text):
                 continue
             for cell in reversed(row):
                 if cell is None:
@@ -135,7 +160,9 @@ def extract_itinerary_page(page_text: str, tables) -> list[dict]:
 
     items = _itinerary_from_text(page_text)
     items += _itinerary_from_tables(tables)
+
     if not items:
+        # 兜底：取本页最大金额（仅在有明确的 CN¥ / CNY 标识时更可靠）
         nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", page_text)
         vals = [clean_amount(n) for n in nums]
         vals = [v for v in vals if v is not None]
