@@ -342,7 +342,7 @@ def render_results(df: pd.DataFrame, prefix: str):
 def tab_itinerary():
     st.subheader("✈️ 行程单识别")
     st.caption("上传航空运输电子客票行程单 PDF（支持多页合并），自动提取每张行程单的金额并汇总")
-    st.info("⚠️ 仅识别**行程单**页面（检测"电子客票/票价/承运人"等特征），发票页将被自动跳过。")
+    st.info('⚠️ 仅识别**行程单**页面（检测\u300c电子客票/票价/承运人\u300d等特征），发票页将被自动跳过。')
 
     uploaded = st.file_uploader(
         "上传行程单 PDF", type=["pdf"], accept_multiple_files=True,
@@ -372,7 +372,7 @@ def tab_itinerary():
 def tab_invoice():
     st.subheader("🧾 发票识别")
     st.caption("上传增值税发票 / 普通发票 PDF（支持多页合并），自动提取每张发票的金额并汇总")
-    st.info("⚠️ 仅识别**发票**页面（检测"发票代码/价税合计/增值税"等特征），行程单页将被自动跳过。")
+    st.info('⚠️ 仅识别**发票**页面（检测\u300c发票代码/价税合计/增值税\u300d等特征），行程单页将被自动跳过。')
 
     uploaded = st.file_uploader(
         "上传发票 PDF", type=["pdf"], accept_multiple_files=True,
