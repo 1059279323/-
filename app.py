@@ -28,25 +28,6 @@ st.set_page_config(
 # 工具函数
 # ═══════════════════════════════════════════════════════════
 
-def extract_text_and_tables(file_bytes: bytes):
-    """从 PDF 字节流中提取文本和表格。返回 (全文, 表格列表)。"""
-    full_text_parts: list[str] = []
-    tables_data: list[list[list[str | None]]] = []
-
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                full_text_parts.append(text)
-
-            tables = page.extract_tables()
-            for tbl in tables:
-                if tbl and len(tbl) > 0:
-                    tables_data.append(tbl)
-
-    return "\n".join(full_text_parts), tables_data
-
-
 def clean_amount(s: str) -> float | None:
     """从字符串中清理并解析金额，失败返回 None。"""
     s = str(s).strip().replace(",", "").replace("，", "").replace(" ", "")
@@ -61,35 +42,45 @@ def clean_amount(s: str) -> float | None:
     return None
 
 
-def find_currency_amounts(text: str) -> list[float]:
-    """在文本中找出所有形如价格的数字（带两位小数）。"""
-    pattern = r"(\d{1,3}(?:,\d{3})*\.\d{2})"
-    amounts: list[float] = []
-    for m in re.finditer(pattern, text):
-        val = clean_amount(m.group(1))
+def _deduplicate(items: list[dict]) -> list[dict]:
+    """按金额去重（同页同金额只保留一条）。"""
+    seen: set[float] = set()
+    result: list[dict] = []
+    for item in items:
+        key = round(item["amount"], 2)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════
+# 单页金额提取（行程单）
+# ═══════════════════════════════════════════════════════════
+
+def _extract_itinerary_from_text(page_text: str) -> list[dict]:
+    """从单页文本中提取所有行程单「合计」金额。"""
+    items: list[dict] = []
+
+    for line in page_text.split("\n"):
+        if not re.search(r"(合计|总计|应付|实付|金额合计)", line):
+            continue
+        nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", line)
+        if not nums:
+            continue
+        # 取该行最后一个金额（通常是合计值）
+        val = clean_amount(nums[-1])
         if val is not None:
-            amounts.append(val)
-    return amounts
+            src = line.strip()[:120]
+            items.append({"amount": val, "source": src})
+
+    return items
 
 
-# ═══════════════════════════════════════════════════════════
-# 行程单金额提取
-# ═══════════════════════════════════════════════════════════
+def _extract_itinerary_from_tables(tables) -> list[dict]:
+    """从单页表格中提取所有行程单「合计」金额。"""
+    items: list[dict] = []
 
-def extract_itinerary_total(text: str, tables) -> float | None:
-    """从行程单中提取「合计」金额。按优先级依次尝试三种策略。"""
-
-    # 策略1：文本中搜索"合计"行
-    for line in text.split("\n"):
-        if re.search(r"(合计|总计|应付|实付|金额合计)", line):
-            nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", line)
-            if nums:
-                for n in reversed(nums):
-                    val = clean_amount(n)
-                    if val is not None:
-                        return val
-
-    # 策略2：表格中搜索"合计"行
     for table in tables:
         if not table:
             continue
@@ -97,72 +88,91 @@ def extract_itinerary_total(text: str, tables) -> float | None:
             if not row:
                 continue
             row_text = " ".join(str(c) for c in row if c)
-            if re.search(r"(合计|总计|小计)", row_text):
-                for cell in reversed(row):
-                    if cell is None:
-                        continue
-                    val = clean_amount(cell)
-                    if val is not None:
-                        return val
+            if not re.search(r"(合计|总计|小计)", row_text):
+                continue
+            # 从右往左找第一个数字
+            for cell in reversed(row):
+                if cell is None:
+                    continue
+                val = clean_amount(cell)
+                if val is not None:
+                    items.append({"amount": val, "source": row_text[:120]})
+                    break  # 每行只取一个
 
-    # 策略3：取全文最大金额（降级策略）
-    amounts = find_currency_amounts(text)
-    if amounts:
-        return max(amounts)
+    return items
 
-    return None
+
+def extract_itinerary_page(page_text: str, tables) -> list[dict]:
+    """从单页行程单提取所有金额（去重后返回）。"""
+    items = _extract_itinerary_from_text(page_text)
+    items += _extract_itinerary_from_tables(tables)
+
+    if not items:
+        # 降级：取本页所有带小数金额的最大值（通常就是合计）
+        all_nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", page_text)
+        valid = [clean_amount(n) for n in all_nums]
+        valid = [v for v in valid if v is not None]
+        if valid:
+            max_val = max(valid)
+            items.append({"amount": max_val, "source": "降级策略：本页最大金额"})
+
+    return _deduplicate(items)
 
 
 # ═══════════════════════════════════════════════════════════
-# 发票金额提取
+# 单页金额提取（发票）
 # ═══════════════════════════════════════════════════════════
 
-def extract_invoice_total(text: str) -> float | None:
-    """从发票中提取「价税合计」金额。按优先级依次尝试三种策略。"""
+_INVOICE_PATTERNS = [
+    (r"价税合计[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "价税合计"),
+    (r"价税合计[：:]*.*?[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "价税合计(宽)"),
+    (r"合计金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "合计金额"),
+    (r"总金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "总金额"),
+    (r"发票金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "发票金额"),
+    (r"金额合计[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "金额合计"),
+    (r"应付金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})", "应付金额"),
+]
 
-    text_compact = re.sub(r"\s+", "", text)
 
-    # 策略1：明确关键字 + 金额
-    keyword_patterns = [
-        r"价税合计[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"价税合计[：:]*.*?[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"合计金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"总金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"发票金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"金额合计[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-        r"应付金额[：:]*[¥￥]?(\d{1,3}(?:,\d{3})*\.\d{2})",
-    ]
+def extract_invoice_page(page_text: str) -> list[dict]:
+    """从单页发票提取所有金额（去重后返回）。"""
+    text_compact = re.sub(r"\s+", "", page_text)
+    items: list[dict] = []
 
-    for pat in keyword_patterns:
-        m = re.search(pat, text_compact)
-        if m:
+    # 策略1：关键字正则（finditer 捕获所有匹配）
+    for pat, label in _INVOICE_PATTERNS:
+        for m in re.finditer(pat, text_compact):
             val = clean_amount(m.group(1))
             if val is not None:
-                return val
+                items.append({"amount": val, "source": label})
 
-    # 策略2：找到"价税合计"位置，向后取邻近金额
-    idx = text_compact.find("价税合计")
-    if idx >= 0:
-        nearby = text_compact[idx : idx + 80]
+    # 策略2：找到"价税合计"位置，取邻近金额
+    for m in re.finditer(r"价税合计", text_compact):
+        start = m.start()
+        nearby = text_compact[start : start + 80]
         nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", nearby)
         for n in nums:
             val = clean_amount(n)
             if val is not None:
-                return val
+                items.append({"amount": val, "source": "价税合计(邻近)"})
 
-    # 策略3：取全文最大金额
-    amounts = find_currency_amounts(text)
-    if amounts:
-        return max(amounts)
+    if not items:
+        # 降级：取本页最大金额
+        all_nums = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", page_text)
+        valid = [clean_amount(n) for n in all_nums]
+        valid = [v for v in valid if v is not None]
+        if valid:
+            max_val = max(valid)
+            items.append({"amount": max_val, "source": "降级策略：本页最大金额"})
 
-    return None
+    return _deduplicate(items)
 
 
 # ═══════════════════════════════════════════════════════════
 # 侧边栏 UI
 # ═══════════════════════════════════════════════════════════
 
-def render_sidebar():
+def render_sidebar() -> str:
     """渲染侧边栏，返回当前选择的模式。"""
     st.sidebar.markdown("## ⚙️ 功能选择")
 
@@ -177,23 +187,27 @@ def render_sidebar():
 
     if "行程单" in mode:
         st.sidebar.markdown("""
-**适用文件：** 航空运输电子客票行程单 PDF
+**适用文件：** 航空运输电子客票行程单 PDF  
+（支持单页或多页合并的 PDF）
 
 1. 上传一个或多个行程单 PDF
 2. 点击「开始识别」
-3. 查看汇总金额，可导出 Excel / CSV
+3. 每页/每条合计各占一行，自动汇总
 
-**识别逻辑：** 文本「合计/总计」→ 表格合计行 → 全文最大金额
+**识别逻辑：**  
+文本「合计」行 → 表格合计行 → 本页最大金额
         """)
     else:
         st.sidebar.markdown("""
-**适用文件：** 增值税发票、普通发票等 PDF
+**适用文件：** 增值税发票、普通发票等 PDF  
+（支持单页或多页合并的 PDF）
 
 1. 上传一个或多个发票 PDF
 2. 点击「开始识别」
-3. 查看汇总金额，可导出 Excel / CSV
+3. 每张发票各占一行，自动汇总
 
-**识别逻辑：** 「价税合计」关键字 → 邻近金额 → 全文最大金额
+**识别逻辑：**  
+「价税合计」关键字 → 邻近金额 → 本页最大金额
         """)
 
     st.sidebar.markdown("---")
@@ -208,19 +222,19 @@ def render_sidebar():
 
 
 # ═══════════════════════════════════════════════════════════
-# 批量处理
+# 批量处理（按页逐条）
 # ═══════════════════════════════════════════════════════════
 
 def process_files(uploaded_files, mode: str) -> pd.DataFrame:
-    """批量处理上传文件并返回结果 DataFrame。"""
+    """逐页处理上传文件，每页可提取多条金额，返回结果 DataFrame。"""
     results: list[dict] = []
     progress_bar = st.progress(0, text="准备中…")
-    total = len(uploaded_files)
+    total_files = len(uploaded_files)
 
     for i, uploaded_file in enumerate(uploaded_files):
         progress_bar.progress(
-            (i + 1) / total,
-            text=f"正在处理: {uploaded_file.name}  ({i + 1}/{total})",
+            (i + 0.1) / total_files,
+            text=f"读取: {uploaded_file.name}  ({i + 1}/{total_files})",
         )
 
         try:
@@ -228,45 +242,69 @@ def process_files(uploaded_files, mode: str) -> pd.DataFrame:
         except Exception as e:
             results.append({
                 "文件名": uploaded_file.name,
+                "页码": "—",
+                "来源": "",
                 "状态": "❌ 读取失败",
                 "识别金额": 0.00,
                 "备注": str(e),
             })
             continue
 
-        text, tables = extract_text_and_tables(file_bytes)
-
-        if not text.strip():
+        try:
+            pdf = pdfplumber.open(BytesIO(file_bytes))
+        except Exception as e:
             results.append({
                 "文件名": uploaded_file.name,
-                "状态": "⚠️ 无文本",
+                "页码": "—",
+                "来源": "",
+                "状态": "❌ 打开失败",
                 "识别金额": 0.00,
-                "备注": "PDF 可能为扫描件或图片，无法提取文字",
+                "备注": str(e),
             })
             continue
 
-        # 根据模式选择提取器
-        if "行程单" in mode:
-            amount = extract_itinerary_total(text, tables)
-        else:
-            amount = extract_invoice_total(text)
-            if amount is None:
-                amount = extract_itinerary_total(text, tables)
+        total_pages = len(pdf.pages)
+        file_has_text = False
 
-        if amount is not None:
+        for page_num, page in enumerate(pdf.pages, 1):
+            progress_bar.progress(
+                (i + page_num / max(total_pages, 1)) / total_files,
+                text=f"{uploaded_file.name} 第{page_num}/{total_pages}页",
+            )
+
+            page_text = page.extract_text() or ""
+            if not page_text.strip():
+                continue
+
+            file_has_text = True
+            tables = page.extract_tables() or []
+
+            # 根据模式选择提取器
+            if "行程单" in mode:
+                items = extract_itinerary_page(page_text, tables)
+            else:
+                items = extract_invoice_page(page_text)
+
+            for item in items:
+                results.append({
+                    "文件名": uploaded_file.name,
+                    "页码": f"第{page_num}页",
+                    "来源": item["source"],
+                    "状态": "✅ 识别成功",
+                    "识别金额": item["amount"],
+                    "备注": "",
+                })
+
+        pdf.close()
+
+        if not file_has_text:
             results.append({
                 "文件名": uploaded_file.name,
-                "状态": "✅ 识别成功",
-                "识别金额": amount,
-                "备注": "",
-            })
-        else:
-            preview = text.strip()[:300].replace("\n", " │ ")
-            results.append({
-                "文件名": uploaded_file.name,
-                "状态": "⚠️ 未识别到金额",
+                "页码": "—",
+                "来源": "",
+                "状态": "⚠️ 无文本",
                 "识别金额": 0.00,
-                "备注": f"文本预览: {preview}…",
+                "备注": "PDF 全部页面均无法提取文字，可能为扫描件",
             })
 
     progress_bar.empty()
@@ -281,18 +319,17 @@ def render_results(df: pd.DataFrame, mode: str):
     """渲染结果表格与汇总信息。"""
     total_amount = df["识别金额"].sum()
     success_count = int((df["状态"] == "✅ 识别成功").sum())
-    fail_count = len(df) - success_count
 
     st.markdown("---")
     cols = st.columns(4)
-    cols[0].metric("📄 文件总数", len(df))
-    cols[1].metric("✅ 成功识别", success_count)
-    cols[2].metric("⚠️ 未能识别", fail_count)
+    cols[0].metric("📄 文件总数", df["文件名"].nunique())
+    cols[1].metric("📋 识别条目", len(df))
+    cols[2].metric("✅ 成功条目", success_count)
     cols[3].metric("💰 汇总金额", f"¥{total_amount:,.2f}")
 
     # 明细表
     st.markdown("---")
-    st.subheader("📊 识别明细")
+    st.subheader("📊 识别明细（每页每条各占一行）")
 
     df_display = df.copy()
     df_display["识别金额"] = df_display["识别金额"].apply(
@@ -301,13 +338,16 @@ def render_results(df: pd.DataFrame, mode: str):
 
     st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-    # 原始文本（可折叠）
-    with st.expander("🔍 查看详细提取信息"):
+    # 来源详情（可折叠）
+    with st.expander("🔍 查看提取来源"):
         for _, row in df.iterrows():
-            st.markdown(f"**{row['文件名']}** — {row['状态']}")
-            if row["备注"]:
-                st.text(row["备注"])
-            st.markdown("---")
+            if row["状态"] != "✅ 识别成功":
+                continue
+            st.markdown(
+                f"**{row['文件名']}** {row['页码']}  "
+                f"→ ¥{row['识别金额']:,.2f}  "
+                f"（来源: {row['来源']}）"
+            )
 
     # 导出
     st.markdown("---")
@@ -339,7 +379,7 @@ def render_results(df: pd.DataFrame, mode: str):
 
 def main():
     st.title("🧾 发票行程单识别工具")
-    st.caption("上传 PDF → 自动识别金额 → 一键汇总导出")
+    st.caption("上传 PDF → 逐页识别金额 → 一键汇总导出")
 
     mode = render_sidebar()
 
@@ -347,7 +387,7 @@ def main():
         "📤 上传 PDF 文件",
         type=["pdf"],
         accept_multiple_files=True,
-        help="支持同时上传多个 PDF，单文件上限 200 MB",
+        help="支持同时上传多个 PDF，单文件上限 200 MB；多页合并 PDF 会自动逐页识别",
     )
 
     if not uploaded_files:
@@ -355,7 +395,7 @@ def main():
         return
 
     if st.button("🔍 开始识别", type="primary", use_container_width=True):
-        with st.spinner("正在识别中，请稍候…"):
+        with st.spinner("正在逐页识别中，请稍候…"):
             df = process_files(uploaded_files, mode)
         render_results(df, mode)
 
