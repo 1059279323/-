@@ -8,9 +8,7 @@ Tab 2 — 发票识别：上传增值税发票等 PDF，逐页提取金额并汇
 """
 
 import streamlit as st
-import pdfplumber
 import re
-import pandas as pd
 from io import BytesIO
 from datetime import datetime
 
@@ -252,6 +250,8 @@ def process_pdfs(uploaded_files, extract_fn, progress_placeholder,
 
     doc_type: 文档类型名称（行程单/发票），仅用于日志状态描述。
     """
+    import pdfplumber
+    import pandas as pd
     rows: list[dict] = []
     total = len(uploaded_files)
 
@@ -330,6 +330,8 @@ def process_pdfs(uploaded_files, extract_fn, progress_placeholder,
 # ═══════════════════════════════════════════════════════════
 
 def render_results(df: pd.DataFrame, prefix: str):
+    import pandas as pd
+    import openpyxl
     if df.empty:
         return
 
